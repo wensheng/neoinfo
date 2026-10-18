@@ -1945,7 +1945,18 @@ def _term_from_process_tree(host: Host) -> tuple[str, bool]:
     return "", saw_login
 
 
+# Terminals reported under another terminal's name.
+_TERM_ALIASES = {
+    "vivida": "vivido",  # Vivida's panes are Vivido terminals
+}
+
+
 def get_term(host: Host, opts: Options) -> str:
+    term = _detect_term(host)
+    return _TERM_ALIASES.get(term.lower(), term)
+
+
+def _detect_term(host: Host) -> str:
     term = ""
     term_program = util.env("TERM_PROGRAM")
     if term_program == "iTerm.app":
@@ -2133,8 +2144,9 @@ def _ghostty_paths(config_home: str, home: str) -> list[str]:
 
 @dataclass(frozen=True)
 class _TermFont:
-    binary: str  # CLI name, also the executable inside the macOS app
-    app: str  # macOS app bundle
+    # (CLI name, macOS app bundle) pairs; the CLI is also the executable in
+    # the bundle. The first one installed is asked for the config.
+    programs: tuple[tuple[str, str], ...]
     query: tuple[str, ...]  # CLI arguments that print the effective config
     parse_query: Callable[[str], str]
     config_paths: Callable[[str, str], list[str]]  # (config_home, home) -> files
@@ -2144,8 +2156,7 @@ class _TermFont:
 
 _TERM_FONTS = {
     "kitty": _TermFont(
-        binary="kitty",
-        app="kitty.app",
+        programs=(("kitty", "kitty.app"),),
         query=("+runpy", "from kitty.cli import *; print(create_default_opts().font_family)"),
         parse_query=_kitty_font_family,
         config_paths=lambda config_home, home: [os.path.join(
@@ -2155,8 +2166,7 @@ _TERM_FONTS = {
         defaults={"": "monospace"},
     ),
     "ghostty": _TermFont(
-        binary="ghostty",
-        app="Ghostty.app",
+        programs=(("ghostty", "Ghostty.app"),),
         query=("+show-config",),
         parse_query=_ghostty_font,
         config_paths=_ghostty_paths,
@@ -2164,17 +2174,17 @@ _TERM_FONTS = {
         defaults={"": "JetBrains Mono"},  # embedded in Ghostty
     ),
     "alacritty": _TermFont(
-        binary="alacritty",
-        app="Alacritty.app",
+        programs=(("alacritty", "Alacritty.app"),),
         query=("msg", "get-config"),
         parse_query=_alacritty_json_font,
         config_paths=lambda config_home, home: _alacritty_paths("alacritty", config_home, home),
         parse_config=_alacritty_conf_font,
         defaults={"macOS": "Menlo", "Windows": "Consolas", "": "monospace"},
     ),
+    # Also covers Vivida, whose panes are Vivido terminals sharing vivido.toml;
+    # `vivida msg get-config` prints the same JSON.
     "vivido": _TermFont(
-        binary="vivido",
-        app="Vivido.app",
+        programs=(("vivido", "Vivido.app"), ("vivida", "Vivida.app")),
         query=("msg", "get-config"),
         parse_query=_alacritty_json_font,
         config_paths=lambda config_home, home: _alacritty_paths("vivido", config_home, home),
@@ -2185,13 +2195,14 @@ _TERM_FONTS = {
 
 
 def _term_binary(source: _TermFont) -> str:
-    found = util.which(source.binary)
-    if found:
-        return found
-    for apps in ("/Applications", os.path.expanduser("~/Applications")):
-        path = os.path.join(apps, source.app, "Contents", "MacOS", source.binary)
-        if os.path.isfile(path):
-            return path
+    for binary, app in source.programs:
+        found = util.which(binary)
+        if found:
+            return found
+        for apps in ("/Applications", os.path.expanduser("~/Applications")):
+            path = os.path.join(apps, app, "Contents", "MacOS", binary)
+            if os.path.isfile(path):
+                return path
     return ""
 
 

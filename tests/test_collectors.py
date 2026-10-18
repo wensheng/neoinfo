@@ -633,7 +633,7 @@ def _write(path, text):
     ],
 )
 def test_get_term_font_asks_terminal(monkeypatch, font_home, term, query_output, expected):
-    monkeypatch.setattr(collectors, "_term_binary", lambda source: f"/bin/{source.binary}")
+    monkeypatch.setattr(collectors, "_term_binary", lambda source: f"/bin/{source.programs[0][0]}")
     calls = []
 
     def fake_run(argv, timeout=10):
@@ -715,3 +715,23 @@ def test_get_term_vivido(monkeypatch):
     assert collectors.get_term(make_host(os="macOS"), Options()) == "vivido"
     _fake_term_env(monkeypatch, {"SHELL": "/bin/zsh", "VIVIDO_WINDOW_ID": "3"}, ["zsh", "tmux: server"])
     assert collectors.get_term(make_host(os="macOS"), Options()) == "vivido"
+
+
+@pytest.mark.parametrize(
+    ("env", "tree"),
+    [
+        ({"SHELL": "/bin/zsh"}, ["-zsh", "/usr/bin/login", "/Applications/Vivida.app/Contents/MacOS/vivida"]),
+        ({"SHELL": "/bin/zsh"}, ["-zsh", "/usr/bin/login", "./target/release/vivida"]),
+        ({"SHELL": "/bin/zsh", "TERM_PROGRAM": "Vivida"}, ["zsh"]),
+    ],
+)
+def test_get_term_vivida_is_vivido(monkeypatch, env, tree):
+    _fake_term_env(monkeypatch, env, tree)
+    assert collectors.get_term(make_host(os="macOS"), Options()) == "vivido"
+
+
+def test_term_binary_falls_back_to_vivida(monkeypatch):
+    # Only Vivida is installed: ask `vivida msg get-config`.
+    monkeypatch.setattr(util, "which", lambda cmd: "/opt/bin/vivida" if cmd == "vivida" else None)
+    monkeypatch.setattr(os.path, "isfile", lambda path: False)
+    assert collectors._term_binary(collectors._TERM_FONTS["vivido"]) == "/opt/bin/vivida"
