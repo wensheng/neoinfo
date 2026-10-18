@@ -585,3 +585,133 @@ def test_get_resolution_macos_old_format(monkeypatch):
     host = make_host(os="macOS")
     assert collectors.get_resolution(host, Options()) == "2560x1600"
     assert collectors.get_resolution(host, Options(refresh_rate="on")) == "2560x1600 @ 60Hz"
+
+
+# -- terminal font: kitty, Ghostty, Alacritty, Vivido ---------------------
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        ('family="JetBrainsMono Nerd Font Mono"', "JetBrainsMono Nerd Font Mono"),
+        ('family="Fira Code" style="Retina" features="+zero"', "Fira Code"),
+        ("family='Iosevka Term'", "Iosevka Term"),
+        ("family=Menlo", "Menlo"),
+        ("postscript_name=FiraCode-Retina", "FiraCode-Retina"),
+        ("Operator Mono Book", "Operator Mono Book"),
+        ("monospace\n", "monospace"),
+    ],
+)
+def test_kitty_font_family(spec, expected):
+    assert collectors._kitty_font_family(spec) == expected
+
+
+@pytest.fixture
+def font_home(monkeypatch, tmp_path):
+    """Empty home and XDG config dir, no SSH, no terminal CLI installed."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    for var in ("SSH_CONNECTION", "KITTY_CONFIG_DIRECTORY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(collectors, "_term_binary", lambda source: "")
+    return tmp_path
+
+
+def _write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+@pytest.mark.parametrize(
+    ("term", "query_output", "expected"),
+    [
+        ("kitty", 'family="JetBrainsMono Nerd Font Mono"\n', "JetBrainsMono Nerd Font Mono"),
+        ("ghostty", "font-family = Hack Nerd Font Mono\nfont-family = Symbols Nerd Font\nfont-size = 15\n",
+         "Hack Nerd Font Mono"),
+        ("alacritty", '{"font":{"normal":{"family":"Menlo","style":null},"size":11.25}}', "Menlo"),
+        ("vivido", '{"font":{"normal":{"family":"JetBrainsMono Nerd Font Mono","style":null}}}',
+         "JetBrainsMono Nerd Font Mono"),
+    ],
+)
+def test_get_term_font_asks_terminal(monkeypatch, font_home, term, query_output, expected):
+    monkeypatch.setattr(collectors, "_term_binary", lambda source: f"/bin/{source.binary}")
+    calls = []
+
+    def fake_run(argv, timeout=10):
+        calls.append(argv)
+        return query_output
+
+    monkeypatch.setattr(util, "run", fake_run)
+    assert collectors.get_term_font(make_host(os="macOS"), Options(), term) == expected
+    assert calls == [[f"/bin/{term}", *collectors._TERM_FONTS[term].query]]
+
+
+def test_get_term_font_kitty_config(font_home):
+    _write(font_home / ".config/kitty/kitty.conf",
+           "# font_family Commented Out\n"
+           "font_family Menlo\n"
+           'font_family      family="JetBrainsMono Nerd Font Mono"\n'
+           "bold_font        auto\n")
+    assert collectors.get_term_font(make_host(), Options(), "kitty") == "JetBrainsMono Nerd Font Mono"
+
+
+def test_get_term_font_ghostty_config_later_file_wins(font_home):
+    _write(font_home / ".config/ghostty/config", 'font-family = "Iosevka"\n')
+    _write(font_home / "Library/Application Support/com.mitchellh.ghostty/config",
+           "# font-family = Commented Out\n"
+           "font-family =\n"  # clears Iosevka
+           'font-family = "Hack Nerd Font Mono"\n'
+           "font-family = Symbols Nerd Font\n")
+    assert collectors.get_term_font(make_host(os="macOS"), Options(), "ghostty") == "Hack Nerd Font Mono"
+
+
+def test_get_term_font_alacritty_toml_with_import(font_home):
+    _write(font_home / ".config/alacritty/fonts.toml", '[font.normal]\nfamily = "Fira Code"\n')
+    _write(font_home / ".config/alacritty/alacritty.toml",
+           '[general]\nimport = ["fonts.toml"]\n\n[font]\nsize = 13.0\n')
+    assert collectors.get_term_font(make_host(), Options(), "alacritty") == "Fira Code"
+    # The main file overrides what it imports.
+    _write(font_home / ".config/alacritty/alacritty.toml",
+           'import = ["~/.config/alacritty/fonts.toml"]\n\n[font]\nnormal = { family = "Menlo" }\n')
+    assert collectors.get_term_font(make_host(), Options(), "alacritty") == "Menlo"
+
+
+def test_get_term_font_alacritty_legacy_yaml(font_home):
+    _write(font_home / ".config/alacritty/alacritty.yml",
+           "font:\n  normal:\n    family: \"Source Code Pro\" # comment\n    style: Regular\n")
+    assert collectors.get_term_font(make_host(), Options(), "alacritty") == "Source Code Pro"
+
+
+def test_get_term_font_vivido_config(font_home):
+    _write(font_home / ".config/vivido/vivido.toml",
+           '[font]\nsize = 13.0\n\n[font.normal]\nfamily = "JetBrainsMono Nerd Font Mono"\n')
+    assert collectors.get_term_font(make_host(os="macOS"), Options(), "vivido") == "JetBrainsMono Nerd Font Mono"
+
+
+@pytest.mark.parametrize(
+    ("term", "os_name", "expected"),
+    [
+        ("alacritty", "macOS", "Menlo"),
+        ("alacritty", "Linux", "monospace"),
+        ("vivido", "macOS", "Menlo"),
+        ("ghostty", "macOS", "JetBrains Mono"),
+        ("kitty", "Linux", "monospace"),
+    ],
+)
+def test_get_term_font_builtin_default(font_home, term, os_name, expected):
+    assert collectors.get_term_font(make_host(os=os_name), Options(), term) == expected
+
+
+def test_get_term_font_skipped_over_ssh(monkeypatch, font_home):
+    monkeypatch.setenv("SSH_CONNECTION", "10.0.0.2 50000 10.0.0.1 22")
+    assert collectors.get_term_font(make_host(), Options(), "kitty") == ""
+
+
+def test_get_term_vivido(monkeypatch):
+    _fake_term_env(
+        monkeypatch,
+        {"SHELL": "/bin/zsh"},
+        ["-zsh", "/usr/bin/login", "/Applications/Vivido.app/Contents/MacOS/vivido"],
+    )
+    assert collectors.get_term(make_host(os="macOS"), Options()) == "vivido"
+    _fake_term_env(monkeypatch, {"SHELL": "/bin/zsh", "VIVIDO_WINDOW_ID": "3"}, ["zsh", "tmux: server"])
+    assert collectors.get_term(make_host(os="macOS"), Options()) == "vivido"

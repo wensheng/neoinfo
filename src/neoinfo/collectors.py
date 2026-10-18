@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import functools
 import glob as _glob
+import json
 import os
 import re
 import shutil
 import socket
+import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from neoinfo import util
@@ -1829,6 +1832,7 @@ _PASS_THROUGH_PROCS = frozenset({
 # Variables a terminal exports to its shells. Used when the process tree
 # doesn't reach the terminal (SSH, tmux, sandboxes).
 _TERM_ENV_VARS = (
+    ("VIVIDO_WINDOW_ID", "vivido"),
     ("KITTY_WINDOW_ID", "kitty"),
     ("KITTY_PID", "kitty"),
     ("ALACRITTY_WINDOW_ID", "alacritty"),
@@ -1851,6 +1855,7 @@ _TERM_BY_TERMINFO = (
     ("xterm-ghostty", "ghostty"),
     ("xterm-termite", "termite"),
     ("alacritty", "alacritty"),
+    ("vivido", "vivido"),
     ("foot", "foot"),
     ("wezterm", "WezTerm"),
     ("rxvt-unicode", "urxvt"),
@@ -1975,29 +1980,247 @@ def get_term(host: Host, opts: Options) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# terminal font: kitty, Ghostty, Alacritty, Vivido
+#
+# Terminals don't expose their font in any common way, so each one gets an
+# entry in _TERM_FONTS and _detect_term_font() tries, in order:
+#   1. asking the terminal: its CLI prints the effective config, with
+#      includes, imports and live changes applied;
+#   2. reading its config file(s);
+#   3. the terminal's built-in default font.
+# ---------------------------------------------------------------------------
+
+def _unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def _dig(data: object, *keys: str) -> object:
+    for key in keys:
+        if not isinstance(data, dict):
+            return None
+        data = data.get(key)
+    return data
+
+
+def _kitty_font_family(spec: str) -> str:
+    """Name from a kitty font_family value.
+
+    kitty 0.36+ writes `family="JetBrainsMono Nerd Font Mono" style=...` or
+    `postscript_name=...`; older configs use a bare name.
+    """
+    spec = util.trim(spec)
+    for key in ("family", "postscript_name"):
+        m = re.search(rf"""\b{key}\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+))""", spec)
+        if m:
+            return next(g for g in m.groups() if g is not None)
+    return spec
+
+
+def _kitty_conf_font(paths: list[str]) -> str:
+    # The last font_family line wins.
+    spec = ""
+    for path in paths:
+        for line in (util.read_text(path) or "").splitlines():
+            m = re.match(r"\s*font_family\s+(.+)", line)
+            if m:
+                spec = m.group(1)
+    return _kitty_font_family(spec) if spec else ""
+
+
+def _ghostty_font(text: str) -> str:
+    """Primary font from Ghostty `font-family = X` lines (config or +show-config).
+
+    Repeated lines build a fallback list; an empty value clears the list.
+    """
+    families: list[str] = []
+    for line in text.splitlines():
+        m = re.match(r"\s*font-family\s*=(.*)$", line)
+        if m:
+            value = _unquote(m.group(1))
+            families = [*families, value] if value else []
+    return families[0] if families else ""
+
+
+def _ghostty_conf_font(paths: list[str]) -> str:
+    # Later files override earlier ones, so read them as one config.
+    return _ghostty_font("\n".join(util.read_text(path) or "" for path in paths))
+
+
+def _alacritty_json_font(text: str) -> str:
+    """font.normal.family from `alacritty msg get-config` (Vivido: `vivido msg get-config`)."""
+    try:
+        family = _dig(json.loads(text), "font", "normal", "family")
+    except ValueError:
+        return ""
+    return family if isinstance(family, str) else ""
+
+
+def _alacritty_toml_font(path: str, depth: int = 0) -> str:
+    """font.normal.family from an Alacritty-style TOML file.
+
+    Imported files load first and the file itself overrides them.
+    """
+    try:
+        data = tomllib.loads(util.read_text(path) or "")
+    except tomllib.TOMLDecodeError:
+        return ""
+    family = ""
+    imports = _dig(data, "general", "import") or data.get("import") or []
+    if isinstance(imports, list) and depth < 5:
+        for item in imports:
+            if isinstance(item, str):
+                # join() keeps an absolute import as is.
+                imported = os.path.join(os.path.dirname(path), os.path.expanduser(item))
+                family = _alacritty_toml_font(imported, depth + 1) or family
+    own = _dig(data, "font", "normal", "family")
+    return own if isinstance(own, str) and own else family
+
+
+def _alacritty_yaml_font(text: str) -> str:
+    """font.normal.family from a pre-0.13 alacritty.yml."""
+    in_normal = False
+    for line in text.splitlines():
+        if re.match(r"\s*normal\s*:", line):
+            in_normal = True
+        elif in_normal and "family" in line and not line.strip().startswith("#"):
+            return line.split("family:", 1)[-1].split("#")[0].replace('"', "").strip()
+        elif in_normal and re.match(r"\S", line):
+            break
+    return ""
+
+
+def _alacritty_conf_font(paths: list[str]) -> str:
+    # Alacritty loads only the first config file it finds.
+    for path in paths:
+        text = util.read_text(path)
+        if text is None:
+            continue
+        if path.endswith((".yml", ".yaml")):
+            return _alacritty_yaml_font(text)
+        return _alacritty_toml_font(path)
+    return ""
+
+
+def _alacritty_paths(name: str, config_home: str, home: str) -> list[str]:
+    """Alacritty's config search order. Vivido, a fork, uses the same with its own name."""
+    paths = [
+        os.path.join(config_home, name, f"{name}.toml"),
+        os.path.join(config_home, f"{name}.toml"),
+        os.path.join(home, ".config", name, f"{name}.toml"),
+        os.path.join(home, f".{name}.toml"),
+        f"/etc/{name}/{name}.toml",
+    ]
+    if name == "alacritty":
+        paths += [
+            os.path.join(config_home, "alacritty", "alacritty.yml"),
+            os.path.join(home, ".alacritty.yml"),
+        ]
+    return paths
+
+
+def _ghostty_paths(config_home: str, home: str) -> list[str]:
+    """Ghostty's config files in load order. The second directory only exists on macOS."""
+    dirs = [
+        os.path.join(config_home, "ghostty"),
+        os.path.join(home, "Library", "Application Support", "com.mitchellh.ghostty"),
+    ]
+    return [os.path.join(d, name) for d in dirs for name in ("config", "config.ghostty")]
+
+
+@dataclass(frozen=True)
+class _TermFont:
+    binary: str  # CLI name, also the executable inside the macOS app
+    app: str  # macOS app bundle
+    query: tuple[str, ...]  # CLI arguments that print the effective config
+    parse_query: Callable[[str], str]
+    config_paths: Callable[[str, str], list[str]]  # (config_home, home) -> files
+    parse_config: Callable[[list[str]], str]
+    defaults: dict[str, str]  # built-in font by host.os; "" = any other OS
+
+
+_TERM_FONTS = {
+    "kitty": _TermFont(
+        binary="kitty",
+        app="kitty.app",
+        query=("+runpy", "from kitty.cli import *; print(create_default_opts().font_family)"),
+        parse_query=_kitty_font_family,
+        config_paths=lambda config_home, home: [os.path.join(
+            util.env("KITTY_CONFIG_DIRECTORY") or os.path.join(config_home, "kitty"), "kitty.conf"
+        )],
+        parse_config=_kitty_conf_font,
+        defaults={"": "monospace"},
+    ),
+    "ghostty": _TermFont(
+        binary="ghostty",
+        app="Ghostty.app",
+        query=("+show-config",),
+        parse_query=_ghostty_font,
+        config_paths=_ghostty_paths,
+        parse_config=_ghostty_conf_font,
+        defaults={"": "JetBrains Mono"},  # embedded in Ghostty
+    ),
+    "alacritty": _TermFont(
+        binary="alacritty",
+        app="Alacritty.app",
+        query=("msg", "get-config"),
+        parse_query=_alacritty_json_font,
+        config_paths=lambda config_home, home: _alacritty_paths("alacritty", config_home, home),
+        parse_config=_alacritty_conf_font,
+        defaults={"macOS": "Menlo", "Windows": "Consolas", "": "monospace"},
+    ),
+    "vivido": _TermFont(
+        binary="vivido",
+        app="Vivido.app",
+        query=("msg", "get-config"),
+        parse_query=_alacritty_json_font,
+        config_paths=lambda config_home, home: _alacritty_paths("vivido", config_home, home),
+        parse_config=_alacritty_conf_font,
+        defaults={"macOS": "Menlo", "Windows": "Consolas", "": "monospace"},
+    ),
+}
+
+
+def _term_binary(source: _TermFont) -> str:
+    found = util.which(source.binary)
+    if found:
+        return found
+    for apps in ("/Applications", os.path.expanduser("~/Applications")):
+        path = os.path.join(apps, source.app, "Contents", "MacOS", source.binary)
+        if os.path.isfile(path):
+            return path
+    return ""
+
+
+def _detect_term_font(host: Host, source: _TermFont, config_home: str, home: str) -> str:
+    binary = _term_binary(source)
+    if binary:
+        out = util.run([binary, *source.query], timeout=3)
+        font = source.parse_query(out) if out else ""
+        if font:
+            return util.trim(font)
+    font = source.parse_config(source.config_paths(config_home, home))
+    if font:
+        return util.trim(font)
+    return source.defaults.get(host.os, source.defaults.get("", ""))
+
+
 def get_term_font(host: Host, opts: Options, term: str = "") -> str:
     if not term:
         term = get_term(host, opts)
     home = os.path.expanduser("~")
     config_home = util.env("XDG_CONFIG_HOME", os.path.join(home, ".config"))
+    source = next((s for name, s in _TERM_FONTS.items() if term.lower().startswith(name)), None)
+    if source:
+        # Over SSH the terminal, and its font, are on the other machine.
+        if util.env("SSH_CONNECTION"):
+            return ""
+        return _detect_term_font(host, source, config_home, home)
     font = ""
-    if term.startswith("alacritty"):
-        candidates = _glob.glob(
-            os.path.join(config_home, "alacritty", "alacritty.y*ml")
-        ) + _glob.glob(os.path.join(home, "alacritty", "alacritty.y*ml"))
-        candidates += _glob.glob(os.path.join(config_home, "alacritty", ".alacritty.y*ml"))
-        if candidates:
-            text = util.read_text(candidates[0]) or ""
-            in_normal = False
-            for line in text.splitlines():
-                if re.match(r"\s*normal\s*:", line):
-                    in_normal = True
-                elif in_normal and "family" in line and not line.strip().startswith("#"):
-                    font = line.split("family:", 1)[-1].split("\n")[0].split("#")[0].replace('"', "").strip()
-                    break
-                elif in_normal and re.match(r"\S", line):
-                    break
-    elif term == "Apple_Terminal":
+    if term == "Apple_Terminal":
         out = util.run(
             ["osascript", "-e", 'tell application "Terminal" to font name of window frontmost']
         )
@@ -2017,14 +2240,6 @@ def get_term_font(host: Host, opts: Options, term: str = "") -> str:
         text = util.read_text(os.path.join(home, ".hyper.js")) or ""
         m = re.search(r"fontFamily\s*:\s*['\"]?([^'\",]+)", text)
         font = util.trim_quotes(util.trim(m.group(1))) if m else ""
-    elif term.startswith("kitty"):
-        if util.which("kitty"):
-            out = util.run(
-                ["kitty", "+runpy",
-                 "from kitty.cli import *; o = create_default_opts(); "
-                 "print(f'{o.font_family} {o.font_size}')"]
-            )
-            font = util.trim(out) if out else ""
     elif term.startswith("lxterminal"):
         text = util.read_text(os.path.join(config_home, "lxterminal/lxterminal.conf")) or ""
         for line in text.splitlines():
