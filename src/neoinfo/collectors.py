@@ -7,6 +7,7 @@ list of (suffix, value) tuples where the display layer prepends the label.
 
 from __future__ import annotations
 
+import functools
 import glob as _glob
 import os
 import re
@@ -74,6 +75,30 @@ def build_host(opts: Options) -> Host:
 
 
 # ---------------------------------------------------------------------------
+# macOS helpers
+# ---------------------------------------------------------------------------
+
+def _sysctl(name: str) -> str:
+    out = util.run(["sysctl", "-n", name])
+    return out.strip() if out else ""
+
+
+def _sysctl_int(name: str) -> int:
+    value = _sysctl(name)
+    return int(value) if value.isdigit() else 0
+
+
+@functools.cache
+def _system_profiler() -> str:
+    """Hardware + display report, shared by Host, GPU and Resolution.
+
+    One call for both data types: system_profiler takes ~0.25s per run.
+    """
+    out = util.run(["system_profiler", "SPHardwareDataType", "SPDisplaysDataType"], timeout=15)
+    return out or ""
+
+
+# ---------------------------------------------------------------------------
 # distro
 # ---------------------------------------------------------------------------
 
@@ -88,13 +113,59 @@ def _parse_os_release(text: str) -> dict[str, str]:
     return info
 
 
+# (version, family, release name). Matches "<version>" or "<version>.*".
+_MACOS_RELEASES = (
+    ("10.4", "Mac OS X", "Tiger"),
+    ("10.5", "Mac OS X", "Leopard"),
+    ("10.6", "Mac OS X", "Snow Leopard"),
+    ("10.7", "Mac OS X", "Lion"),
+    ("10.8", "OS X", "Mountain Lion"),
+    ("10.9", "OS X", "Mavericks"),
+    ("10.10", "OS X", "Yosemite"),
+    ("10.11", "OS X", "El Capitan"),
+    ("10.12", "macOS", "Sierra"),
+    ("10.13", "macOS", "High Sierra"),
+    ("10.14", "macOS", "Mojave"),
+    ("10.15", "macOS", "Catalina"),
+    ("10.16", "macOS", "Big Sur"),
+    ("11", "macOS", "Big Sur"),
+    ("12", "macOS", "Monterey"),
+    ("13", "macOS", "Ventura"),
+    ("14", "macOS", "Sonoma"),
+    ("15", "macOS", "Sequoia"),
+    ("26", "macOS", "Tahoe"),
+)
+
+
+def _macos_distro(shorthand: str) -> str:
+    """"macOS Sequoia 15.6 24G84"; newer releases not in the table show as "macOS 27.0 26A434"."""
+    version = util.trim(util.run(["sw_vers", "-productVersion"]) or "")
+    build = util.trim(util.run(["sw_vers", "-buildVersion"]) or "")
+    if not version:
+        return ""
+    family, name = "macOS", ""
+    for prefix, fam, release in _MACOS_RELEASES:
+        if version == prefix or version.startswith(prefix + "."):
+            family, name = fam, release
+            break
+    if shorthand == "tiny":
+        return f"{family} {version}"
+    distro = util.trim(f"{family} {name} {version}")
+    if shorthand != "on":
+        distro = util.trim(f"{distro} {build}")
+    return distro
+
+
 def get_distro(host: Host, opts: Options) -> str:
     """Detect the distro name. Mirrors neofetch's get_distro()."""
-    if host.os not in ("Linux", "BSD", "MINIX"):
-        return {"macOS": "", "Windows": ""}.get(host.os, host.os or "Unknown")
+    if host.os not in ("Linux", "BSD", "MINIX", "Mac OS X", "macOS"):
+        return {"Windows": ""}.get(host.os, host.os or "Unknown")
 
     distro = ""
     shorthand = opts.distro_shorthand
+
+    if host.os in ("Mac OS X", "macOS"):
+        distro = _macos_distro(shorthand)
 
     def _read(path: str) -> str | None:
         return util.read_text(path)
@@ -311,6 +382,14 @@ def get_model(host: Host, opts: Options) -> str:
     elif host.os == "BSD":
         out = util.run(["sysctl", "-n", "hw.vendor", "hw.product"]) or ""
         model = util.trim(out.replace("\n", " "))
+    elif host.os in ("Mac OS X", "macOS"):
+        # "Mac mini (Mac16,10)"; neofetch shows only the identifier.
+        identifier = _sysctl("hw.model")
+        m = re.search(r"^\s*Model Name:\s*(.+?)\s*$", _system_profiler(), re.M)
+        if m and identifier:
+            model = f"{m.group(1)} ({identifier})"
+        else:
+            model = identifier or (m.group(1) if m else "")
     if model.startswith("To Be Filled"):
         model = ""
     for dummy in _DUMMY_OEM:
@@ -386,6 +465,13 @@ def get_uptime(host: Host, opts: Options) -> str:
                 seconds = int(float(text.split()[0]))
             except (ValueError, IndexError):
                 seconds = None
+    elif host.os in ("Mac OS X", "macOS", "BSD"):
+        # kern.boottime: "{ sec = 1790886054, usec = 385528 } Thu Oct  1 15:20:54 2026"
+        m = re.search(r"sec\s*=\s*(\d+)", _sysctl("kern.boottime"))
+        if m:
+            import time
+
+            seconds = int(time.time()) - int(m.group(1))
     if seconds is None:
         out = util.run(["uptime", "-s"])
         if out:
@@ -447,6 +533,51 @@ def get_packages(host: Host, opts: Options) -> str:
         n = _count_lines(util.run(argv, timeout=30), header)
         packages += n
         pac(n, mgr)
+
+    def count_brew() -> None:
+        # Formulae and casks together, as one "brew" entry like neofetch.
+        nonlocal packages
+        n = 0
+        for flag in ("--cellar", "--caskroom"):
+            out = util.run(["brew", flag])
+            if out and util.trim(out):
+                n += len(_glob.glob(os.path.join(util.trim(out), "*")))
+        packages += n
+        pac(n, "brew")
+
+    def count_nix(include_default: bool) -> None:
+        nonlocal packages
+        n = _count_lines(util.run(["nix-store", "-qR", "/run/current-system/sw"], timeout=60))
+        packages += n
+        pac(n, "nix-system")
+        user_pkgs = ""
+        for path in (
+            os.path.expanduser("~/.nix-profile"),
+            f"/etc/profiles/per-user/{util.env('USER')}",
+        ):
+            user_pkgs += util.run(["nix-store", "-qR", path], timeout=60) or ""
+        n = _count_lines(user_pkgs)
+        packages += n
+        pac(n, "nix-user")
+        if include_default:
+            n = _count_lines(
+                util.run(["nix-store", "-qR", "/nix/var/nix/profiles/default"], timeout=60)
+            )
+            packages += n
+            pac(n, "nix-default")
+
+    if host.os in ("Mac OS X", "macOS", "MINIX"):
+        if util.which("port"):
+            # First line is "The following ports are currently installed:".
+            tot(["port", "installed"], "port", header=1)
+        if util.which("brew"):
+            count_brew()
+        if util.which("pkgin"):
+            tot(["pkgin", "list"], "pkgin")
+        if util.which("dpkg"):
+            tot(["dpkg-query", "-f", ".\n", "-W"], "dpkg")
+        if util.which("nix-store"):
+            count_nix(include_default=False)
 
     if host.os in ("Linux", "BSD", "Solaris"):
         if util.which("kiss"):
@@ -512,11 +643,7 @@ def get_packages(host: Host, opts: Options) -> str:
             tot(["mine", "-q"], "mine")
 
         if util.which("brew"):
-            for cmd in (["brew", "--cellar"], ["brew", "--caskroom"]):
-                out = util.run(cmd)
-                n = _count_glob([f"{util.trim(out)}/*"]) if out else 0
-                packages += n
-                pac(n, "brew")
+            count_brew()
         if _glob.glob("/var/db/pkg/*/*") or util.which("emerge"):
             n = _count_glob(["/var/db/pkg/*/*"])
             packages += n
@@ -550,27 +677,7 @@ def get_packages(host: Host, opts: Options) -> str:
             pac(n, "guix-user")
 
         if util.which("nix-store"):
-            n = _count_lines(
-                util.run(["nix-store", "-qR", "/run/current-system/sw"], timeout=60)
-            )
-            packages += n
-            pac(n, "nix-system")
-            user_pkgs = ""
-            for path in (
-                os.path.expanduser("~/.nix-profile"),
-                f"/etc/profiles/per-user/{util.env('USER')}",
-            ):
-                user_pkgs += util.run(["nix-store", "-qR", path], timeout=60) or ""
-            n = _count_lines(user_pkgs)
-            packages += n
-            pac(n, "nix-user")
-            n = _count_lines(
-                util.run(
-                    ["nix-store", "-qR", "/nix/var/nix/profiles/default"], timeout=60
-                )
-            )
-            packages += n
-            pac(n, "nix-default")
+            count_nix(include_default=True)
 
         if host.os == "Linux" and "FreeBSD" not in host.kernel_name:
             if util.which("pkginfo"):
@@ -1007,7 +1114,38 @@ def _cpu_temp_celsius() -> str:
     return ""
 
 
+def _strip_cpu_brand(cpu: str) -> str:
+    for brand in ("AMD ", "Intel ", "Core? Duo ", "Qualcomm "):
+        cpu = re.sub(brand, "", cpu, count=1) if "?" in brand else cpu.replace(brand, "", 1)
+    return cpu
+
+
+def _get_cpu_macos(opts: Options) -> str:
+    # Intel: "Intel(R) Core(TM) i7-8700B CPU @ 3.20GHz"; Apple Silicon: "Apple M4".
+    cpu = _clean_cpu_name(_sysctl("machdep.cpu.brand_string"))
+    cores = ""
+    if opts.cpu_cores in ("logical", "on"):
+        cores = _sysctl("hw.logicalcpu_max")
+    elif opts.cpu_cores == "physical":
+        cores = _sysctl("hw.physicalcpu_max")
+
+    if opts.cpu_brand == "off":
+        cpu = _strip_cpu_brand(cpu)
+    if opts.cpu_speed == "off":
+        cpu = re.sub(r"\s*@.*", "", cpu)
+    if opts.cpu_cores != "off" and cores.isdigit():
+        # Cores go before the speed, like neofetch. Apple Silicon names
+        # carry no speed, so append them instead.
+        if "@" in cpu:
+            cpu = cpu.replace("@", f"({cores}) @", 1)
+        else:
+            cpu = f"{cpu} ({cores})"
+    return util.trim(cpu)
+
+
 def get_cpu(host: Host, opts: Options) -> str:
+    if host.os in ("Mac OS X", "macOS"):
+        return _get_cpu_macos(opts)
     if host.os not in ("Linux", "MINIX", "Windows"):
         return ""
     cpuinfo = util.read_text("/proc/cpuinfo") or ""
@@ -1088,8 +1226,7 @@ def get_cpu(host: Host, opts: Options) -> str:
     speed = re.sub(r"\s+", "", speed)
 
     if opts.cpu_brand == "off":
-        for brand in ("AMD ", "Intel ", "Core? Duo ", "Qualcomm "):
-            cpu = re.sub(brand, "", cpu, count=1) if "?" in brand else cpu.replace(brand, "", 1)
+        cpu = _strip_cpu_brand(cpu)
 
     if opts.cpu_cores != "off" and cores:
         cpu = f"{cpu} ({cores})"
@@ -1136,8 +1273,21 @@ def _lspci_gpu_raw(line: str) -> str:
     return f"{fields[0] if fields else ''} {head} {tail}"
 
 
+def _get_gpu_macos(opts: Options) -> list[tuple[str, str]]:
+    # One line listing every GPU, like neofetch: "AMD Radeon Pro 560X, Intel UHD Graphics 630".
+    names = re.findall(r"^\s*Chipset Model:\s*(.+?)\s*$", _system_profiler(), re.M)
+    gpu = ", ".join(names)
+    if opts.gpu_brand == "off":
+        for brand in ("AMD", "NVIDIA", "Intel"):
+            gpu = gpu.replace(brand, "", 1)
+    gpu = util.trim(gpu)
+    return [("", gpu)] if gpu else []
+
+
 def get_gpu(host: Host, opts: Options) -> list[tuple[str, str]]:
     """Return [(suffix, name)] lines. Mirrors get_gpu()'s prin calls."""
+    if host.os in ("Mac OS X", "macOS"):
+        return _get_gpu_macos(opts)
     if host.os != "Linux":
         return []
     out = util.run(["lspci", "-mm"], timeout=15) or ""
@@ -1200,9 +1350,21 @@ def get_gpu(host: Host, opts: Options) -> list[tuple[str, str]]:
 # memory
 # ---------------------------------------------------------------------------
 
-def get_memory(host: Host, opts: Options) -> str:
-    if host.os not in ("Linux", "Windows"):
-        return ""
+def _memory_macos() -> tuple[int, int]:
+    """Return (used MiB, total MiB): app + wired + compressed, as Activity Monitor counts it."""
+    pagesize = _sysctl_int("hw.pagesize")
+    total_mib = _sysctl_int("hw.memsize") // 1024 // 1024
+    app_pages = _sysctl_int("vm.page_pageable_internal_count") - _sysctl_int("vm.page_purgeable_count")
+    vm_stat = util.run(["vm_stat"]) or ""
+    wired = re.search(r"Pages wired down:\s*(\d+)", vm_stat)
+    compressed = re.search(r"Pages occupied by compressor:\s*(\d+)", vm_stat)
+    pages = app_pages + (int(wired.group(1)) if wired else 0) + (int(compressed.group(1)) if compressed else 0)
+    used_mib = pages * pagesize // 1024 // 1024
+    return used_mib, total_mib
+
+
+def _memory_proc_meminfo() -> tuple[int, int]:
+    """Return (used MiB, total MiB) from /proc/meminfo."""
     mem_total = 0
     mem_used = 0
     mem_avail: int | None = None
@@ -1228,7 +1390,18 @@ def get_memory(host: Host, opts: Options) -> str:
         used_mib = (mem_total - mem_avail) // 1024
     else:
         used_mib = mem_used // 1024
-    total_mib = mem_total // 1024
+    return used_mib, mem_total // 1024
+
+
+def get_memory(host: Host, opts: Options) -> str:
+    if host.os in ("Mac OS X", "macOS"):
+        used_mib, total_mib = _memory_macos()
+    elif host.os in ("Linux", "Windows"):
+        used_mib, total_mib = _memory_proc_meminfo()
+    else:
+        return ""
+    if not total_mib:
+        return ""
 
     percent = ""
     if opts.memory_percent == "on" and total_mib:
@@ -1409,8 +1582,35 @@ def get_song(host: Host, opts: Options) -> list[tuple[str, str]] | str:
 # resolution
 # ---------------------------------------------------------------------------
 
+def _resolution_macos(opts: Options) -> str:
+    """Physical pixels of each display, e.g. "6016x3384, 2560x1440".
+
+    system_profiler prints, per display:
+        Resolution: 6016 x 3384            (older macOS: "... @ 60Hz")
+        UI Looks like: 3008 x 1692 @ 30.00Hz
+    """
+    displays: list[list[str]] = []  # [[pixels, refresh rate], ...]
+    for line in _system_profiler().splitlines():
+        m = re.search(r"^\s*Resolution:\s*(\d+)\s*x\s*(\d+)(?:.*?@\s*([\d.]+)\s*Hz)?", line)
+        if m:
+            displays.append([f"{m.group(1)}x{m.group(2)}", m.group(3) or ""])
+            continue
+        m = re.search(r"^\s*UI Looks like:.*@\s*([\d.]+)\s*Hz", line)
+        if m and displays and not displays[-1][1]:
+            displays[-1][1] = m.group(1)
+    parts = []
+    for pixels, rate in displays:
+        rate = rate.rstrip("0").rstrip(".") if "." in rate else rate
+        if opts.refresh_rate == "on" and rate and rate != "0":
+            pixels = f"{pixels} @ {rate}Hz"
+        parts.append(pixels)
+    return ", ".join(parts)
+
+
 def get_resolution(host: Host, opts: Options) -> str:
     resolution = ""
+    if host.os in ("Mac OS X", "macOS"):
+        return _resolution_macos(opts)
     if host.os in ("Linux", "BSD", "Solaris", "AIX", "IRIX"):
         if (
             util.which("xrandr")
@@ -1618,6 +1818,128 @@ def _process_name(pid: int) -> str:
     return util.trim(out) if out else ""
 
 
+# Processes that sit between neoinfo and the terminal: shells, screen and
+# the launchers people use to run Python tools. Names ending in "sh"
+# (bash, zsh, fish, ...) are skipped as well.
+_PASS_THROUGH_PROCS = frozenset({
+    "screen", "newgrp", "nu", "elvish", "xonsh", "ion", "env",
+    "uv", "uvx", "pipx", "poetry", "pdm", "hatch", "rye",
+})
+
+# Variables a terminal exports to its shells. Used when the process tree
+# doesn't reach the terminal (SSH, tmux, sandboxes).
+_TERM_ENV_VARS = (
+    ("KITTY_WINDOW_ID", "kitty"),
+    ("KITTY_PID", "kitty"),
+    ("ALACRITTY_WINDOW_ID", "alacritty"),
+    ("ALACRITTY_SOCKET", "alacritty"),
+    ("GHOSTTY_RESOURCES_DIR", "ghostty"),
+    ("WEZTERM_PANE", "WezTerm"),
+    ("KONSOLE_VERSION", "konsole"),
+    ("TILIX_ID", "tilix"),
+    ("TERMINATOR_UUID", "terminator"),
+    ("GNOME_TERMINAL_SCREEN", "gnome-terminal"),
+    ("TERMINOLOGY", "terminology"),
+    ("XTERM_VERSION", "xterm"),
+    ("MLTERM", "mlterm"),
+)
+
+# $TERM values that name one terminal. SSH always forwards $TERM, so this
+# still works on the remote side. Matches "<value>" or "<value>-<suffix>".
+_TERM_BY_TERMINFO = (
+    ("xterm-kitty", "kitty"),
+    ("xterm-ghostty", "ghostty"),
+    ("xterm-termite", "termite"),
+    ("alacritty", "alacritty"),
+    ("foot", "foot"),
+    ("wezterm", "WezTerm"),
+    ("rxvt-unicode", "urxvt"),
+    ("st", "st"),
+    ("konsole", "konsole"),
+    ("terminology", "terminology"),
+    ("mlterm", "mlterm"),
+    ("contour", "contour"),
+    ("rio", "rio"),
+    ("mintty", "mintty"),
+)
+
+
+def _term_from_env() -> str:
+    for var, name in _TERM_ENV_VARS:
+        if util.env(var):
+            return name
+    # iTerm2 sets LC_TERMINAL, and ssh forwards LC_* by default.
+    lc_terminal = util.env("LC_TERMINAL")
+    if lc_terminal:
+        return lc_terminal
+    term_var = util.env("TERM")
+    for value, name in _TERM_BY_TERMINFO:
+        if term_var == value or term_var.startswith(value + "-"):
+            return name
+    return ""
+
+
+def _term_from_process_tree(host: Host) -> tuple[str, bool]:
+    """Walk up from neoinfo's parent to the first terminal-like process.
+
+    Returns the terminal name ("" if none) and whether the walk ended on a
+    bare console (a `login` or `init` with no terminal above it).
+    """
+    shell_name = os.path.basename(util.env("SHELL", ""))
+    saw_login = False
+    try:
+        parent = _ppid(os.getpid())
+    except (ValueError, OSError):
+        parent = None
+    while parent:
+        raw = _process_name(parent)
+        # macOS `ps` gives full paths ("/usr/bin/login") and marks login
+        # shells with a dash ("-zsh").
+        name = os.path.basename(raw.replace(" ", "")).lstrip("-")
+        if (
+            (shell_name and name.startswith(shell_name))
+            or name.endswith("sh")
+            or name.startswith("su")
+            or name in _PASS_THROUGH_PROCS
+        ):
+            pass
+        elif name.startswith("login") or "Login" in name:
+            # On macOS the terminal starts the shell through login, so keep
+            # going: the terminal is login's parent.
+            saw_login = True
+        elif name in ("init", "(init)"):
+            return "", True
+        elif name in ("ruby", "1", "systemd") or name.startswith(
+            ("tmux", "sshd", "python", "kdeinit", "launchd", "bwrap")
+        ) or ("USER" in name and "PID" in name):
+            break
+        elif name == "gnome-terminal-":
+            return "gnome-terminal", False
+        elif name == "urxvtd":
+            return "urxvt", False
+        elif "nvim" in name:
+            return "Neovim Terminal", False
+        elif "NeoVimServer" in name:
+            return "VimR Terminal", False
+        else:
+            term = name
+            if host.os == "Linux":
+                exe = f"/proc/{parent}/exe"
+                try:
+                    real = os.path.realpath(exe)
+                except OSError:
+                    real = exe
+                # realpath hands back the link itself when it can't read it.
+                if real != exe:
+                    term = os.path.basename(real)
+            if term.startswith(".") and term.endswith("-wrapped"):
+                term = term[1: -len("-wrapped")]
+            if term:
+                return term, False
+        parent = _ppid(parent)
+    return "", saw_login
+
+
 def get_term(host: Host, opts: Options) -> str:
     term = ""
     term_program = util.env("TERM_PROGRAM")
@@ -1631,52 +1953,26 @@ def get_term(host: Host, opts: Options) -> str:
         term = term_program.replace(".app", "")
     if util.env("TERM") in ("tw52", "tw100"):
         term = "TosWin2"
-    if util.env("SSH_CONNECTION"):
-        term = util.env("SSH_TTY")
     if util.env("WT_SESSION"):
         term = "Windows Terminal"
+    if term:
+        return term
 
-    shell_name = util.env("SHELL", "").split("/")[-1]
-    parent: int | None = None
-    try:
-        parent = _ppid(os.getpid())
-    except (ValueError, OSError):
-        parent = None
-    while not term and parent:
-        name = _process_name(parent)
-        squashed = name.replace(" ", "")
-        if squashed in (shell_name, "sh", "screen") or squashed.startswith("su") or squashed == "newgrp":
-            pass
-        elif squashed.startswith("login") or "Login" in squashed or squashed in ("init", "(init)"):
-            out = util.run(["tty"])
-            term = util.trim(out) if out else ""
-        elif squashed in ("ruby", "1", "systemd") or squashed.startswith(
-            ("tmux", "sshd", "python", "kdeinit", "launchd", "bwrap")
-        ) or ("USER" in squashed and "PID" in squashed):
-            break
-        elif squashed == "gnome-terminal-":
-            term = "gnome-terminal"
-        elif squashed == "urxvtd":
-            term = "urxvt"
-        elif "nvim" in squashed:
-            term = "Neovim Terminal"
-        elif "NeoVimServer" in squashed:
-            term = "VimR Terminal"
-        else:
-            if host.os == "Linux":
-                try:
-                    term = os.path.realpath(f"/proc/{parent}/exe")
-                except OSError:
-                    term = name
-            else:
-                term = name
-            term = term.split("/")[-1]
-            if term.startswith(".") and term.endswith("-wrapped"):
-                term = term[1: -len("-wrapped")]
-        if term:
-            break
-        parent = _ppid(parent)
-    return term
+    term, on_console = _term_from_process_tree(host)
+    if term:
+        return term
+    term = _term_from_env()
+    if term:
+        return term
+
+    # Nothing names the terminal. Show the tty as a last resort: an SSH
+    # session from an unidentifiable client, or a bare console login.
+    if util.env("SSH_CONNECTION") and util.env("SSH_TTY"):
+        return util.env("SSH_TTY")
+    if on_console:
+        out = util.run(["tty"])
+        return util.trim(out) if out else ""
+    return ""
 
 
 def get_term_font(host: Host, opts: Options, term: str = "") -> str:
