@@ -7,11 +7,15 @@ list of (suffix, value) tuples where the display layer prepends the label.
 
 from __future__ import annotations
 
+import functools
 import glob as _glob
+import json
 import os
 import re
 import shutil
 import socket
+import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from neoinfo import util
@@ -74,6 +78,30 @@ def build_host(opts: Options) -> Host:
 
 
 # ---------------------------------------------------------------------------
+# macOS helpers
+# ---------------------------------------------------------------------------
+
+def _sysctl(name: str) -> str:
+    out = util.run(["sysctl", "-n", name])
+    return out.strip() if out else ""
+
+
+def _sysctl_int(name: str) -> int:
+    value = _sysctl(name)
+    return int(value) if value.isdigit() else 0
+
+
+@functools.cache
+def _system_profiler() -> str:
+    """Hardware + display report, shared by Host, GPU and Resolution.
+
+    One call for both data types: system_profiler takes ~0.25s per run.
+    """
+    out = util.run(["system_profiler", "SPHardwareDataType", "SPDisplaysDataType"], timeout=15)
+    return out or ""
+
+
+# ---------------------------------------------------------------------------
 # distro
 # ---------------------------------------------------------------------------
 
@@ -88,13 +116,59 @@ def _parse_os_release(text: str) -> dict[str, str]:
     return info
 
 
+# (version, family, release name). Matches "<version>" or "<version>.*".
+_MACOS_RELEASES = (
+    ("10.4", "Mac OS X", "Tiger"),
+    ("10.5", "Mac OS X", "Leopard"),
+    ("10.6", "Mac OS X", "Snow Leopard"),
+    ("10.7", "Mac OS X", "Lion"),
+    ("10.8", "OS X", "Mountain Lion"),
+    ("10.9", "OS X", "Mavericks"),
+    ("10.10", "OS X", "Yosemite"),
+    ("10.11", "OS X", "El Capitan"),
+    ("10.12", "macOS", "Sierra"),
+    ("10.13", "macOS", "High Sierra"),
+    ("10.14", "macOS", "Mojave"),
+    ("10.15", "macOS", "Catalina"),
+    ("10.16", "macOS", "Big Sur"),
+    ("11", "macOS", "Big Sur"),
+    ("12", "macOS", "Monterey"),
+    ("13", "macOS", "Ventura"),
+    ("14", "macOS", "Sonoma"),
+    ("15", "macOS", "Sequoia"),
+    ("26", "macOS", "Tahoe"),
+)
+
+
+def _macos_distro(shorthand: str) -> str:
+    """"macOS Sequoia 15.6 24G84"; newer releases not in the table show as "macOS 27.0 26A434"."""
+    version = util.trim(util.run(["sw_vers", "-productVersion"]) or "")
+    build = util.trim(util.run(["sw_vers", "-buildVersion"]) or "")
+    if not version:
+        return ""
+    family, name = "macOS", ""
+    for prefix, fam, release in _MACOS_RELEASES:
+        if version == prefix or version.startswith(prefix + "."):
+            family, name = fam, release
+            break
+    if shorthand == "tiny":
+        return f"{family} {version}"
+    distro = util.trim(f"{family} {name} {version}")
+    if shorthand != "on":
+        distro = util.trim(f"{distro} {build}")
+    return distro
+
+
 def get_distro(host: Host, opts: Options) -> str:
     """Detect the distro name. Mirrors neofetch's get_distro()."""
-    if host.os not in ("Linux", "BSD", "MINIX"):
-        return {"macOS": "", "Windows": ""}.get(host.os, host.os or "Unknown")
+    if host.os not in ("Linux", "BSD", "MINIX", "Mac OS X", "macOS"):
+        return {"Windows": ""}.get(host.os, host.os or "Unknown")
 
     distro = ""
     shorthand = opts.distro_shorthand
+
+    if host.os in ("Mac OS X", "macOS"):
+        distro = _macos_distro(shorthand)
 
     def _read(path: str) -> str | None:
         return util.read_text(path)
@@ -311,6 +385,14 @@ def get_model(host: Host, opts: Options) -> str:
     elif host.os == "BSD":
         out = util.run(["sysctl", "-n", "hw.vendor", "hw.product"]) or ""
         model = util.trim(out.replace("\n", " "))
+    elif host.os in ("Mac OS X", "macOS"):
+        # "Mac mini (Mac16,10)"; neofetch shows only the identifier.
+        identifier = _sysctl("hw.model")
+        m = re.search(r"^\s*Model Name:\s*(.+?)\s*$", _system_profiler(), re.M)
+        if m and identifier:
+            model = f"{m.group(1)} ({identifier})"
+        else:
+            model = identifier or (m.group(1) if m else "")
     if model.startswith("To Be Filled"):
         model = ""
     for dummy in _DUMMY_OEM:
@@ -386,6 +468,13 @@ def get_uptime(host: Host, opts: Options) -> str:
                 seconds = int(float(text.split()[0]))
             except (ValueError, IndexError):
                 seconds = None
+    elif host.os in ("Mac OS X", "macOS", "BSD"):
+        # kern.boottime: "{ sec = 1790886054, usec = 385528 } Thu Oct  1 15:20:54 2026"
+        m = re.search(r"sec\s*=\s*(\d+)", _sysctl("kern.boottime"))
+        if m:
+            import time
+
+            seconds = int(time.time()) - int(m.group(1))
     if seconds is None:
         out = util.run(["uptime", "-s"])
         if out:
@@ -447,6 +536,51 @@ def get_packages(host: Host, opts: Options) -> str:
         n = _count_lines(util.run(argv, timeout=30), header)
         packages += n
         pac(n, mgr)
+
+    def count_brew() -> None:
+        # Formulae and casks together, as one "brew" entry like neofetch.
+        nonlocal packages
+        n = 0
+        for flag in ("--cellar", "--caskroom"):
+            out = util.run(["brew", flag])
+            if out and util.trim(out):
+                n += len(_glob.glob(os.path.join(util.trim(out), "*")))
+        packages += n
+        pac(n, "brew")
+
+    def count_nix(include_default: bool) -> None:
+        nonlocal packages
+        n = _count_lines(util.run(["nix-store", "-qR", "/run/current-system/sw"], timeout=60))
+        packages += n
+        pac(n, "nix-system")
+        user_pkgs = ""
+        for path in (
+            os.path.expanduser("~/.nix-profile"),
+            f"/etc/profiles/per-user/{util.env('USER')}",
+        ):
+            user_pkgs += util.run(["nix-store", "-qR", path], timeout=60) or ""
+        n = _count_lines(user_pkgs)
+        packages += n
+        pac(n, "nix-user")
+        if include_default:
+            n = _count_lines(
+                util.run(["nix-store", "-qR", "/nix/var/nix/profiles/default"], timeout=60)
+            )
+            packages += n
+            pac(n, "nix-default")
+
+    if host.os in ("Mac OS X", "macOS", "MINIX"):
+        if util.which("port"):
+            # First line is "The following ports are currently installed:".
+            tot(["port", "installed"], "port", header=1)
+        if util.which("brew"):
+            count_brew()
+        if util.which("pkgin"):
+            tot(["pkgin", "list"], "pkgin")
+        if util.which("dpkg"):
+            tot(["dpkg-query", "-f", ".\n", "-W"], "dpkg")
+        if util.which("nix-store"):
+            count_nix(include_default=False)
 
     if host.os in ("Linux", "BSD", "Solaris"):
         if util.which("kiss"):
@@ -512,11 +646,7 @@ def get_packages(host: Host, opts: Options) -> str:
             tot(["mine", "-q"], "mine")
 
         if util.which("brew"):
-            for cmd in (["brew", "--cellar"], ["brew", "--caskroom"]):
-                out = util.run(cmd)
-                n = _count_glob([f"{util.trim(out)}/*"]) if out else 0
-                packages += n
-                pac(n, "brew")
+            count_brew()
         if _glob.glob("/var/db/pkg/*/*") or util.which("emerge"):
             n = _count_glob(["/var/db/pkg/*/*"])
             packages += n
@@ -550,27 +680,7 @@ def get_packages(host: Host, opts: Options) -> str:
             pac(n, "guix-user")
 
         if util.which("nix-store"):
-            n = _count_lines(
-                util.run(["nix-store", "-qR", "/run/current-system/sw"], timeout=60)
-            )
-            packages += n
-            pac(n, "nix-system")
-            user_pkgs = ""
-            for path in (
-                os.path.expanduser("~/.nix-profile"),
-                f"/etc/profiles/per-user/{util.env('USER')}",
-            ):
-                user_pkgs += util.run(["nix-store", "-qR", path], timeout=60) or ""
-            n = _count_lines(user_pkgs)
-            packages += n
-            pac(n, "nix-user")
-            n = _count_lines(
-                util.run(
-                    ["nix-store", "-qR", "/nix/var/nix/profiles/default"], timeout=60
-                )
-            )
-            packages += n
-            pac(n, "nix-default")
+            count_nix(include_default=True)
 
         if host.os == "Linux" and "FreeBSD" not in host.kernel_name:
             if util.which("pkginfo"):
@@ -1007,7 +1117,38 @@ def _cpu_temp_celsius() -> str:
     return ""
 
 
+def _strip_cpu_brand(cpu: str) -> str:
+    for brand in ("AMD ", "Intel ", "Core? Duo ", "Qualcomm "):
+        cpu = re.sub(brand, "", cpu, count=1) if "?" in brand else cpu.replace(brand, "", 1)
+    return cpu
+
+
+def _get_cpu_macos(opts: Options) -> str:
+    # Intel: "Intel(R) Core(TM) i7-8700B CPU @ 3.20GHz"; Apple Silicon: "Apple M4".
+    cpu = _clean_cpu_name(_sysctl("machdep.cpu.brand_string"))
+    cores = ""
+    if opts.cpu_cores in ("logical", "on"):
+        cores = _sysctl("hw.logicalcpu_max")
+    elif opts.cpu_cores == "physical":
+        cores = _sysctl("hw.physicalcpu_max")
+
+    if opts.cpu_brand == "off":
+        cpu = _strip_cpu_brand(cpu)
+    if opts.cpu_speed == "off":
+        cpu = re.sub(r"\s*@.*", "", cpu)
+    if opts.cpu_cores != "off" and cores.isdigit():
+        # Cores go before the speed, like neofetch. Apple Silicon names
+        # carry no speed, so append them instead.
+        if "@" in cpu:
+            cpu = cpu.replace("@", f"({cores}) @", 1)
+        else:
+            cpu = f"{cpu} ({cores})"
+    return util.trim(cpu)
+
+
 def get_cpu(host: Host, opts: Options) -> str:
+    if host.os in ("Mac OS X", "macOS"):
+        return _get_cpu_macos(opts)
     if host.os not in ("Linux", "MINIX", "Windows"):
         return ""
     cpuinfo = util.read_text("/proc/cpuinfo") or ""
@@ -1088,8 +1229,7 @@ def get_cpu(host: Host, opts: Options) -> str:
     speed = re.sub(r"\s+", "", speed)
 
     if opts.cpu_brand == "off":
-        for brand in ("AMD ", "Intel ", "Core? Duo ", "Qualcomm "):
-            cpu = re.sub(brand, "", cpu, count=1) if "?" in brand else cpu.replace(brand, "", 1)
+        cpu = _strip_cpu_brand(cpu)
 
     if opts.cpu_cores != "off" and cores:
         cpu = f"{cpu} ({cores})"
@@ -1136,8 +1276,21 @@ def _lspci_gpu_raw(line: str) -> str:
     return f"{fields[0] if fields else ''} {head} {tail}"
 
 
+def _get_gpu_macos(opts: Options) -> list[tuple[str, str]]:
+    # One line listing every GPU, like neofetch: "AMD Radeon Pro 560X, Intel UHD Graphics 630".
+    names = re.findall(r"^\s*Chipset Model:\s*(.+?)\s*$", _system_profiler(), re.M)
+    gpu = ", ".join(names)
+    if opts.gpu_brand == "off":
+        for brand in ("AMD", "NVIDIA", "Intel"):
+            gpu = gpu.replace(brand, "", 1)
+    gpu = util.trim(gpu)
+    return [("", gpu)] if gpu else []
+
+
 def get_gpu(host: Host, opts: Options) -> list[tuple[str, str]]:
     """Return [(suffix, name)] lines. Mirrors get_gpu()'s prin calls."""
+    if host.os in ("Mac OS X", "macOS"):
+        return _get_gpu_macos(opts)
     if host.os != "Linux":
         return []
     out = util.run(["lspci", "-mm"], timeout=15) or ""
@@ -1200,9 +1353,21 @@ def get_gpu(host: Host, opts: Options) -> list[tuple[str, str]]:
 # memory
 # ---------------------------------------------------------------------------
 
-def get_memory(host: Host, opts: Options) -> str:
-    if host.os not in ("Linux", "Windows"):
-        return ""
+def _memory_macos() -> tuple[int, int]:
+    """Return (used MiB, total MiB): app + wired + compressed, as Activity Monitor counts it."""
+    pagesize = _sysctl_int("hw.pagesize")
+    total_mib = _sysctl_int("hw.memsize") // 1024 // 1024
+    app_pages = _sysctl_int("vm.page_pageable_internal_count") - _sysctl_int("vm.page_purgeable_count")
+    vm_stat = util.run(["vm_stat"]) or ""
+    wired = re.search(r"Pages wired down:\s*(\d+)", vm_stat)
+    compressed = re.search(r"Pages occupied by compressor:\s*(\d+)", vm_stat)
+    pages = app_pages + (int(wired.group(1)) if wired else 0) + (int(compressed.group(1)) if compressed else 0)
+    used_mib = pages * pagesize // 1024 // 1024
+    return used_mib, total_mib
+
+
+def _memory_proc_meminfo() -> tuple[int, int]:
+    """Return (used MiB, total MiB) from /proc/meminfo."""
     mem_total = 0
     mem_used = 0
     mem_avail: int | None = None
@@ -1228,7 +1393,18 @@ def get_memory(host: Host, opts: Options) -> str:
         used_mib = (mem_total - mem_avail) // 1024
     else:
         used_mib = mem_used // 1024
-    total_mib = mem_total // 1024
+    return used_mib, mem_total // 1024
+
+
+def get_memory(host: Host, opts: Options) -> str:
+    if host.os in ("Mac OS X", "macOS"):
+        used_mib, total_mib = _memory_macos()
+    elif host.os in ("Linux", "Windows"):
+        used_mib, total_mib = _memory_proc_meminfo()
+    else:
+        return ""
+    if not total_mib:
+        return ""
 
     percent = ""
     if opts.memory_percent == "on" and total_mib:
@@ -1409,8 +1585,35 @@ def get_song(host: Host, opts: Options) -> list[tuple[str, str]] | str:
 # resolution
 # ---------------------------------------------------------------------------
 
+def _resolution_macos(opts: Options) -> str:
+    """Physical pixels of each display, e.g. "6016x3384, 2560x1440".
+
+    system_profiler prints, per display:
+        Resolution: 6016 x 3384            (older macOS: "... @ 60Hz")
+        UI Looks like: 3008 x 1692 @ 30.00Hz
+    """
+    displays: list[list[str]] = []  # [[pixels, refresh rate], ...]
+    for line in _system_profiler().splitlines():
+        m = re.search(r"^\s*Resolution:\s*(\d+)\s*x\s*(\d+)(?:.*?@\s*([\d.]+)\s*Hz)?", line)
+        if m:
+            displays.append([f"{m.group(1)}x{m.group(2)}", m.group(3) or ""])
+            continue
+        m = re.search(r"^\s*UI Looks like:.*@\s*([\d.]+)\s*Hz", line)
+        if m and displays and not displays[-1][1]:
+            displays[-1][1] = m.group(1)
+    parts = []
+    for pixels, rate in displays:
+        rate = rate.rstrip("0").rstrip(".") if "." in rate else rate
+        if opts.refresh_rate == "on" and rate and rate != "0":
+            pixels = f"{pixels} @ {rate}Hz"
+        parts.append(pixels)
+    return ", ".join(parts)
+
+
 def get_resolution(host: Host, opts: Options) -> str:
     resolution = ""
+    if host.os in ("Mac OS X", "macOS"):
+        return _resolution_macos(opts)
     if host.os in ("Linux", "BSD", "Solaris", "AIX", "IRIX"):
         if (
             util.which("xrandr")
@@ -1618,7 +1821,142 @@ def _process_name(pid: int) -> str:
     return util.trim(out) if out else ""
 
 
+# Processes that sit between neoinfo and the terminal: shells, screen and
+# the launchers people use to run Python tools. Names ending in "sh"
+# (bash, zsh, fish, ...) are skipped as well.
+_PASS_THROUGH_PROCS = frozenset({
+    "screen", "newgrp", "nu", "elvish", "xonsh", "ion", "env",
+    "uv", "uvx", "pipx", "poetry", "pdm", "hatch", "rye",
+})
+
+# Variables a terminal exports to its shells. Used when the process tree
+# doesn't reach the terminal (SSH, tmux, sandboxes).
+_TERM_ENV_VARS = (
+    ("VIVIDO_WINDOW_ID", "vivido"),
+    ("KITTY_WINDOW_ID", "kitty"),
+    ("KITTY_PID", "kitty"),
+    ("ALACRITTY_WINDOW_ID", "alacritty"),
+    ("ALACRITTY_SOCKET", "alacritty"),
+    ("GHOSTTY_RESOURCES_DIR", "ghostty"),
+    ("WEZTERM_PANE", "WezTerm"),
+    ("KONSOLE_VERSION", "konsole"),
+    ("TILIX_ID", "tilix"),
+    ("TERMINATOR_UUID", "terminator"),
+    ("GNOME_TERMINAL_SCREEN", "gnome-terminal"),
+    ("TERMINOLOGY", "terminology"),
+    ("XTERM_VERSION", "xterm"),
+    ("MLTERM", "mlterm"),
+)
+
+# $TERM values that name one terminal. SSH always forwards $TERM, so this
+# still works on the remote side. Matches "<value>" or "<value>-<suffix>".
+_TERM_BY_TERMINFO = (
+    ("xterm-kitty", "kitty"),
+    ("xterm-ghostty", "ghostty"),
+    ("xterm-termite", "termite"),
+    ("alacritty", "alacritty"),
+    ("vivido", "vivido"),
+    ("foot", "foot"),
+    ("wezterm", "WezTerm"),
+    ("rxvt-unicode", "urxvt"),
+    ("st", "st"),
+    ("konsole", "konsole"),
+    ("terminology", "terminology"),
+    ("mlterm", "mlterm"),
+    ("contour", "contour"),
+    ("rio", "rio"),
+    ("mintty", "mintty"),
+)
+
+
+def _term_from_env() -> str:
+    for var, name in _TERM_ENV_VARS:
+        if util.env(var):
+            return name
+    # iTerm2 sets LC_TERMINAL, and ssh forwards LC_* by default.
+    lc_terminal = util.env("LC_TERMINAL")
+    if lc_terminal:
+        return lc_terminal
+    term_var = util.env("TERM")
+    for value, name in _TERM_BY_TERMINFO:
+        if term_var == value or term_var.startswith(value + "-"):
+            return name
+    return ""
+
+
+def _term_from_process_tree(host: Host) -> tuple[str, bool]:
+    """Walk up from neoinfo's parent to the first terminal-like process.
+
+    Returns the terminal name ("" if none) and whether the walk ended on a
+    bare console (a `login` or `init` with no terminal above it).
+    """
+    shell_name = os.path.basename(util.env("SHELL", ""))
+    saw_login = False
+    try:
+        parent = _ppid(os.getpid())
+    except (ValueError, OSError):
+        parent = None
+    while parent:
+        raw = _process_name(parent)
+        # macOS `ps` gives full paths ("/usr/bin/login") and marks login
+        # shells with a dash ("-zsh").
+        name = os.path.basename(raw.replace(" ", "")).lstrip("-")
+        if (
+            (shell_name and name.startswith(shell_name))
+            or name.endswith("sh")
+            or name.startswith("su")
+            or name in _PASS_THROUGH_PROCS
+        ):
+            pass
+        elif name.startswith("login") or "Login" in name:
+            # On macOS the terminal starts the shell through login, so keep
+            # going: the terminal is login's parent.
+            saw_login = True
+        elif name in ("init", "(init)"):
+            return "", True
+        elif name in ("ruby", "1", "systemd") or name.startswith(
+            ("tmux", "sshd", "python", "kdeinit", "launchd", "bwrap")
+        ) or ("USER" in name and "PID" in name):
+            break
+        elif name == "gnome-terminal-":
+            return "gnome-terminal", False
+        elif name == "urxvtd":
+            return "urxvt", False
+        elif "nvim" in name:
+            return "Neovim Terminal", False
+        elif "NeoVimServer" in name:
+            return "VimR Terminal", False
+        else:
+            term = name
+            if host.os == "Linux":
+                exe = f"/proc/{parent}/exe"
+                try:
+                    real = os.path.realpath(exe)
+                except OSError:
+                    real = exe
+                # realpath hands back the link itself when it can't read it.
+                if real != exe:
+                    term = os.path.basename(real)
+            if term.startswith(".") and term.endswith("-wrapped"):
+                term = term[1: -len("-wrapped")]
+            if term:
+                return term, False
+        parent = _ppid(parent)
+    return "", saw_login
+
+
+# Terminals reported under another terminal's name.
+_TERM_ALIASES = {
+    "vivida": "vivido",  # Vivida's panes are Vivido terminals
+}
+
+
 def get_term(host: Host, opts: Options) -> str:
+    term = _detect_term(host)
+    return _TERM_ALIASES.get(term.lower(), term)
+
+
+def _detect_term(host: Host) -> str:
     term = ""
     term_program = util.env("TERM_PROGRAM")
     if term_program == "iTerm.app":
@@ -1631,52 +1969,254 @@ def get_term(host: Host, opts: Options) -> str:
         term = term_program.replace(".app", "")
     if util.env("TERM") in ("tw52", "tw100"):
         term = "TosWin2"
-    if util.env("SSH_CONNECTION"):
-        term = util.env("SSH_TTY")
     if util.env("WT_SESSION"):
         term = "Windows Terminal"
+    if term:
+        return term
 
-    shell_name = util.env("SHELL", "").split("/")[-1]
-    parent: int | None = None
+    term, on_console = _term_from_process_tree(host)
+    if term:
+        return term
+    term = _term_from_env()
+    if term:
+        return term
+
+    # Nothing names the terminal. Show the tty as a last resort: an SSH
+    # session from an unidentifiable client, or a bare console login.
+    if util.env("SSH_CONNECTION") and util.env("SSH_TTY"):
+        return util.env("SSH_TTY")
+    if on_console:
+        out = util.run(["tty"])
+        return util.trim(out) if out else ""
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# terminal font: kitty, Ghostty, Alacritty, Vivido
+#
+# Terminals don't expose their font in any common way, so each one gets an
+# entry in _TERM_FONTS and _detect_term_font() tries, in order:
+#   1. asking the terminal: its CLI prints the effective config, with
+#      includes, imports and live changes applied;
+#   2. reading its config file(s);
+#   3. the terminal's built-in default font.
+# ---------------------------------------------------------------------------
+
+def _unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def _dig(data: object, *keys: str) -> object:
+    for key in keys:
+        if not isinstance(data, dict):
+            return None
+        data = data.get(key)
+    return data
+
+
+def _kitty_font_family(spec: str) -> str:
+    """Name from a kitty font_family value.
+
+    kitty 0.36+ writes `family="JetBrainsMono Nerd Font Mono" style=...` or
+    `postscript_name=...`; older configs use a bare name.
+    """
+    spec = util.trim(spec)
+    for key in ("family", "postscript_name"):
+        m = re.search(rf"""\b{key}\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+))""", spec)
+        if m:
+            return next(g for g in m.groups() if g is not None)
+    return spec
+
+
+def _kitty_conf_font(paths: list[str]) -> str:
+    # The last font_family line wins.
+    spec = ""
+    for path in paths:
+        for line in (util.read_text(path) or "").splitlines():
+            m = re.match(r"\s*font_family\s+(.+)", line)
+            if m:
+                spec = m.group(1)
+    return _kitty_font_family(spec) if spec else ""
+
+
+def _ghostty_font(text: str) -> str:
+    """Primary font from Ghostty `font-family = X` lines (config or +show-config).
+
+    Repeated lines build a fallback list; an empty value clears the list.
+    """
+    families: list[str] = []
+    for line in text.splitlines():
+        m = re.match(r"\s*font-family\s*=(.*)$", line)
+        if m:
+            value = _unquote(m.group(1))
+            families = [*families, value] if value else []
+    return families[0] if families else ""
+
+
+def _ghostty_conf_font(paths: list[str]) -> str:
+    # Later files override earlier ones, so read them as one config.
+    return _ghostty_font("\n".join(util.read_text(path) or "" for path in paths))
+
+
+def _alacritty_json_font(text: str) -> str:
+    """font.normal.family from `alacritty msg get-config` (Vivido: `vivido msg get-config`)."""
     try:
-        parent = _ppid(os.getpid())
-    except (ValueError, OSError):
-        parent = None
-    while not term and parent:
-        name = _process_name(parent)
-        squashed = name.replace(" ", "")
-        if squashed in (shell_name, "sh", "screen") or squashed.startswith("su") or squashed == "newgrp":
-            pass
-        elif squashed.startswith("login") or "Login" in squashed or squashed in ("init", "(init)"):
-            out = util.run(["tty"])
-            term = util.trim(out) if out else ""
-        elif squashed in ("ruby", "1", "systemd") or squashed.startswith(
-            ("tmux", "sshd", "python", "kdeinit", "launchd", "bwrap")
-        ) or ("USER" in squashed and "PID" in squashed):
+        family = _dig(json.loads(text), "font", "normal", "family")
+    except ValueError:
+        return ""
+    return family if isinstance(family, str) else ""
+
+
+def _alacritty_toml_font(path: str, depth: int = 0) -> str:
+    """font.normal.family from an Alacritty-style TOML file.
+
+    Imported files load first and the file itself overrides them.
+    """
+    try:
+        data = tomllib.loads(util.read_text(path) or "")
+    except tomllib.TOMLDecodeError:
+        return ""
+    family = ""
+    imports = _dig(data, "general", "import") or data.get("import") or []
+    if isinstance(imports, list) and depth < 5:
+        for item in imports:
+            if isinstance(item, str):
+                # join() keeps an absolute import as is.
+                imported = os.path.join(os.path.dirname(path), os.path.expanduser(item))
+                family = _alacritty_toml_font(imported, depth + 1) or family
+    own = _dig(data, "font", "normal", "family")
+    return own if isinstance(own, str) and own else family
+
+
+def _alacritty_yaml_font(text: str) -> str:
+    """font.normal.family from a pre-0.13 alacritty.yml."""
+    in_normal = False
+    for line in text.splitlines():
+        if re.match(r"\s*normal\s*:", line):
+            in_normal = True
+        elif in_normal and "family" in line and not line.strip().startswith("#"):
+            return line.split("family:", 1)[-1].split("#")[0].replace('"', "").strip()
+        elif in_normal and re.match(r"\S", line):
             break
-        elif squashed == "gnome-terminal-":
-            term = "gnome-terminal"
-        elif squashed == "urxvtd":
-            term = "urxvt"
-        elif "nvim" in squashed:
-            term = "Neovim Terminal"
-        elif "NeoVimServer" in squashed:
-            term = "VimR Terminal"
-        else:
-            if host.os == "Linux":
-                try:
-                    term = os.path.realpath(f"/proc/{parent}/exe")
-                except OSError:
-                    term = name
-            else:
-                term = name
-            term = term.split("/")[-1]
-            if term.startswith(".") and term.endswith("-wrapped"):
-                term = term[1: -len("-wrapped")]
-        if term:
-            break
-        parent = _ppid(parent)
-    return term
+    return ""
+
+
+def _alacritty_conf_font(paths: list[str]) -> str:
+    # Alacritty loads only the first config file it finds.
+    for path in paths:
+        text = util.read_text(path)
+        if text is None:
+            continue
+        if path.endswith((".yml", ".yaml")):
+            return _alacritty_yaml_font(text)
+        return _alacritty_toml_font(path)
+    return ""
+
+
+def _alacritty_paths(name: str, config_home: str, home: str) -> list[str]:
+    """Alacritty's config search order. Vivido, a fork, uses the same with its own name."""
+    paths = [
+        os.path.join(config_home, name, f"{name}.toml"),
+        os.path.join(config_home, f"{name}.toml"),
+        os.path.join(home, ".config", name, f"{name}.toml"),
+        os.path.join(home, f".{name}.toml"),
+        f"/etc/{name}/{name}.toml",
+    ]
+    if name == "alacritty":
+        paths += [
+            os.path.join(config_home, "alacritty", "alacritty.yml"),
+            os.path.join(home, ".alacritty.yml"),
+        ]
+    return paths
+
+
+def _ghostty_paths(config_home: str, home: str) -> list[str]:
+    """Ghostty's config files in load order. The second directory only exists on macOS."""
+    dirs = [
+        os.path.join(config_home, "ghostty"),
+        os.path.join(home, "Library", "Application Support", "com.mitchellh.ghostty"),
+    ]
+    return [os.path.join(d, name) for d in dirs for name in ("config", "config.ghostty")]
+
+
+@dataclass(frozen=True)
+class _TermFont:
+    # (CLI name, macOS app bundle) pairs; the CLI is also the executable in
+    # the bundle. The first one installed is asked for the config.
+    programs: tuple[tuple[str, str], ...]
+    query: tuple[str, ...]  # CLI arguments that print the effective config
+    parse_query: Callable[[str], str]
+    config_paths: Callable[[str, str], list[str]]  # (config_home, home) -> files
+    parse_config: Callable[[list[str]], str]
+    defaults: dict[str, str]  # built-in font by host.os; "" = any other OS
+
+
+_TERM_FONTS = {
+    "kitty": _TermFont(
+        programs=(("kitty", "kitty.app"),),
+        query=("+runpy", "from kitty.cli import *; print(create_default_opts().font_family)"),
+        parse_query=_kitty_font_family,
+        config_paths=lambda config_home, home: [os.path.join(
+            util.env("KITTY_CONFIG_DIRECTORY") or os.path.join(config_home, "kitty"), "kitty.conf"
+        )],
+        parse_config=_kitty_conf_font,
+        defaults={"": "monospace"},
+    ),
+    "ghostty": _TermFont(
+        programs=(("ghostty", "Ghostty.app"),),
+        query=("+show-config",),
+        parse_query=_ghostty_font,
+        config_paths=_ghostty_paths,
+        parse_config=_ghostty_conf_font,
+        defaults={"": "JetBrains Mono"},  # embedded in Ghostty
+    ),
+    "alacritty": _TermFont(
+        programs=(("alacritty", "Alacritty.app"),),
+        query=("msg", "get-config"),
+        parse_query=_alacritty_json_font,
+        config_paths=lambda config_home, home: _alacritty_paths("alacritty", config_home, home),
+        parse_config=_alacritty_conf_font,
+        defaults={"macOS": "Menlo", "Windows": "Consolas", "": "monospace"},
+    ),
+    # Also covers Vivida, whose panes are Vivido terminals sharing vivido.toml;
+    # `vivida msg get-config` prints the same JSON.
+    "vivido": _TermFont(
+        programs=(("vivido", "Vivido.app"), ("vivida", "Vivida.app")),
+        query=("msg", "get-config"),
+        parse_query=_alacritty_json_font,
+        config_paths=lambda config_home, home: _alacritty_paths("vivido", config_home, home),
+        parse_config=_alacritty_conf_font,
+        defaults={"macOS": "Menlo", "Windows": "Consolas", "": "monospace"},
+    ),
+}
+
+
+def _term_binary(source: _TermFont) -> str:
+    for binary, app in source.programs:
+        found = util.which(binary)
+        if found:
+            return found
+        for apps in ("/Applications", os.path.expanduser("~/Applications")):
+            path = os.path.join(apps, app, "Contents", "MacOS", binary)
+            if os.path.isfile(path):
+                return path
+    return ""
+
+
+def _detect_term_font(host: Host, source: _TermFont, config_home: str, home: str) -> str:
+    binary = _term_binary(source)
+    if binary:
+        out = util.run([binary, *source.query], timeout=3)
+        font = source.parse_query(out) if out else ""
+        if font:
+            return util.trim(font)
+    font = source.parse_config(source.config_paths(config_home, home))
+    if font:
+        return util.trim(font)
+    return source.defaults.get(host.os, source.defaults.get("", ""))
 
 
 def get_term_font(host: Host, opts: Options, term: str = "") -> str:
@@ -1684,24 +2224,14 @@ def get_term_font(host: Host, opts: Options, term: str = "") -> str:
         term = get_term(host, opts)
     home = os.path.expanduser("~")
     config_home = util.env("XDG_CONFIG_HOME", os.path.join(home, ".config"))
+    source = next((s for name, s in _TERM_FONTS.items() if term.lower().startswith(name)), None)
+    if source:
+        # Over SSH the terminal, and its font, are on the other machine.
+        if util.env("SSH_CONNECTION"):
+            return ""
+        return _detect_term_font(host, source, config_home, home)
     font = ""
-    if term.startswith("alacritty"):
-        candidates = _glob.glob(
-            os.path.join(config_home, "alacritty", "alacritty.y*ml")
-        ) + _glob.glob(os.path.join(home, "alacritty", "alacritty.y*ml"))
-        candidates += _glob.glob(os.path.join(config_home, "alacritty", ".alacritty.y*ml"))
-        if candidates:
-            text = util.read_text(candidates[0]) or ""
-            in_normal = False
-            for line in text.splitlines():
-                if re.match(r"\s*normal\s*:", line):
-                    in_normal = True
-                elif in_normal and "family" in line and not line.strip().startswith("#"):
-                    font = line.split("family:", 1)[-1].split("\n")[0].split("#")[0].replace('"', "").strip()
-                    break
-                elif in_normal and re.match(r"\S", line):
-                    break
-    elif term == "Apple_Terminal":
+    if term == "Apple_Terminal":
         out = util.run(
             ["osascript", "-e", 'tell application "Terminal" to font name of window frontmost']
         )
@@ -1721,14 +2251,6 @@ def get_term_font(host: Host, opts: Options, term: str = "") -> str:
         text = util.read_text(os.path.join(home, ".hyper.js")) or ""
         m = re.search(r"fontFamily\s*:\s*['\"]?([^'\",]+)", text)
         font = util.trim_quotes(util.trim(m.group(1))) if m else ""
-    elif term.startswith("kitty"):
-        if util.which("kitty"):
-            out = util.run(
-                ["kitty", "+runpy",
-                 "from kitty.cli import *; o = create_default_opts(); "
-                 "print(f'{o.font_family} {o.font_size}')"]
-            )
-            font = util.trim(out) if out else ""
     elif term.startswith("lxterminal"):
         text = util.read_text(os.path.join(config_home, "lxterminal/lxterminal.conf")) or ""
         for line in text.splitlines():
